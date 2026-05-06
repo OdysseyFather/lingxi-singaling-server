@@ -281,6 +281,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			msg.From = peer.InstanceID
 			hub.sendTo(msg.To, msg)
+
+		case "heartbeat":
+			if peer != nil {
+				peer.lastSeen = time.Now()
+			}
+			conn.WriteJSON(SignalMessage{Type: "heartbeat_ack"})
 		}
 	}
 }
