@@ -103,21 +103,54 @@ var serverSecret = os.Getenv("SIGNALING_SECRET") // HMAC 签名密钥
 
 func (h *Hub) register(p *PeerInfo) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if old, ok := h.peers[p.InstanceID]; ok {
 		old.mu.Lock()
 		old.conn.Close()
 		old.mu.Unlock()
 	}
 	h.peers[p.InstanceID] = p
+	h.mu.Unlock()
 	log.Printf("[hub] registered: %s (%s)", p.InstanceID, p.Nickname)
+
+	// 广播 peer_online 给所有其他在线节点
+	h.broadcastPeerEvent("peer_online", p)
 }
 
 func (h *Hub) unregister(id string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	p := h.peers[id]
 	delete(h.peers, id)
+	h.mu.Unlock()
 	log.Printf("[hub] unregistered: %s", id)
+
+	// 广播 peer_offline 给所有其他在线节点
+	if p != nil {
+		h.broadcastPeerEvent("peer_offline", p)
+	}
+}
+
+func (h *Hub) broadcastPeerEvent(eventType string, p *PeerInfo) {
+	data := jsonRaw(map[string]interface{}{
+		"instance_id": p.InstanceID,
+		"nickname":    p.Nickname,
+		"user_id":     p.UserID,
+		"avatar_url":  p.AvatarURL,
+		"agents":      p.Agents,
+	})
+	msg := SignalMessage{Type: eventType, Data: data}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for id, peer := range h.peers {
+		if id == p.InstanceID {
+			continue
+		}
+		go func(peer *PeerInfo) {
+			peer.mu.Lock()
+			defer peer.mu.Unlock()
+			peer.conn.WriteJSON(msg)
+		}(peer)
+	}
 }
 
 func (h *Hub) getPeer(id string) *PeerInfo {
@@ -147,7 +180,7 @@ func (h *Hub) sendTo(targetID string, msg SignalMessage) error {
 	p := h.peers[targetID]
 	h.mu.RUnlock()
 	if p == nil {
-		return nil
+		return fmt.Errorf("peer_offline")
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -258,7 +291,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			msg.From = peer.InstanceID
-			hub.sendTo(msg.To, msg)
+			if err := hub.sendTo(msg.To, msg); err != nil {
+				conn.WriteJSON(SignalMessage{
+					Type: "delivery_failed",
+					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "connect_request"}),
+				})
+			}
 
 		case "connect_respond":
 			if msg.To == "" || peer == nil {
@@ -269,7 +307,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			msg.From = peer.InstanceID
-			hub.sendTo(msg.To, msg)
+			if err := hub.sendTo(msg.To, msg); err != nil {
+				conn.WriteJSON(SignalMessage{
+					Type: "delivery_failed",
+					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "connect_respond"}),
+				})
+			}
 
 		case "relay":
 			if msg.To == "" || peer == nil {
@@ -280,7 +323,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			msg.From = peer.InstanceID
-			hub.sendTo(msg.To, msg)
+			if err := hub.sendTo(msg.To, msg); err != nil {
+				conn.WriteJSON(SignalMessage{
+					Type: "delivery_failed",
+					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "relay"}),
+				})
+			}
 
 		case "heartbeat":
 			if peer != nil {
