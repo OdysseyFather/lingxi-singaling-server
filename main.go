@@ -15,6 +15,13 @@ import (
 
 // ─── 数据结构 ────────────────────────────────────────────────────
 
+// writeMsg 是写入通道中的消息载体，区分 JSON 消息和 WebSocket 控制帧
+type writeMsg struct {
+	json    *SignalMessage // JSON 消息（二选一）
+	msgType int           // 控制帧类型（websocket.PingMessage 等）
+	data    []byte        // 控制帧数据
+}
+
 type PeerInfo struct {
 	InstanceID string  `json:"instance_id"`
 	Nickname   string  `json:"nickname"`
@@ -27,7 +34,54 @@ type PeerInfo struct {
 	LocalPort  int     `json:"local_port,omitempty"`
 	conn       *websocket.Conn
 	lastSeen   time.Time
-	mu         sync.Mutex
+	writeCh    chan writeMsg
+	closeCh    chan struct{}
+	closeOnce  sync.Once
+}
+
+// enqueue 向写入通道发送消息，通道满或已关闭时静默丢弃
+func (p *PeerInfo) enqueue(msg writeMsg) {
+	select {
+	case p.writeCh <- msg:
+	case <-p.closeCh:
+	default:
+		log.Printf("[peer] write channel full, dropping message for %s", p.InstanceID)
+	}
+}
+
+// enqueueJSON 便捷方法：发送 JSON 消息
+func (p *PeerInfo) enqueueJSON(msg SignalMessage) {
+	p.enqueue(writeMsg{json: &msg})
+}
+
+// writeLoop 是每个 peer 唯一的写协程，串行化所有写操作
+func (p *PeerInfo) writeLoop() {
+	defer p.conn.Close()
+	for {
+		select {
+		case <-p.closeCh:
+			return
+		case wm := <-p.writeCh:
+			if wm.json != nil {
+				if err := p.conn.WriteJSON(wm.json); err != nil {
+					log.Printf("[peer] writeLoop WriteJSON error for %s: %v", p.InstanceID, err)
+					return
+				}
+			} else {
+				if err := p.conn.WriteMessage(wm.msgType, wm.data); err != nil {
+					log.Printf("[peer] writeLoop WriteMessage error for %s: %v", p.InstanceID, err)
+					return
+				}
+			}
+		}
+	}
+}
+
+// close 关闭 peer 的写入通道（幂等）
+func (p *PeerInfo) close() {
+	p.closeOnce.Do(func() {
+		close(p.closeCh)
+	})
 }
 
 type Agent struct {
@@ -73,9 +127,7 @@ var upgrader = websocket.Upgrader{
 func (h *Hub) register(p *PeerInfo) {
 	h.mu.Lock()
 	if old, ok := h.peers[p.InstanceID]; ok {
-		old.mu.Lock()
-		old.conn.Close()
-		old.mu.Unlock()
+		old.close()
 	}
 	h.peers[p.InstanceID] = p
 	h.mu.Unlock()
@@ -93,6 +145,7 @@ func (h *Hub) unregister(id string) {
 	log.Printf("[hub] unregistered: %s", id)
 
 	if p != nil {
+		p.close()
 		h.broadcastPeerEvent("peer_offline", p)
 	}
 }
@@ -117,11 +170,7 @@ func (h *Hub) broadcastPeerEvent(eventType string, p *PeerInfo) {
 		if id == p.InstanceID {
 			continue
 		}
-		go func(peer *PeerInfo) {
-			peer.mu.Lock()
-			defer peer.mu.Unlock()
-			peer.conn.WriteJSON(msg)
-		}(peer)
+		peer.enqueueJSON(msg)
 	}
 }
 
@@ -151,6 +200,7 @@ func (h *Hub) listOnlinePeers() []map[string]interface{} {
 	return out
 }
 
+// sendTo 通过写入通道将消息投递给目标 peer，不再直接写连接
 func (h *Hub) sendTo(targetID string, msg SignalMessage) error {
 	h.mu.RLock()
 	p := h.peers[targetID]
@@ -158,9 +208,13 @@ func (h *Hub) sendTo(targetID string, msg SignalMessage) error {
 	if p == nil {
 		return fmt.Errorf("peer_offline")
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.conn.WriteJSON(msg)
+	select {
+	case <-p.closeCh:
+		return fmt.Errorf("peer_offline")
+	default:
+	}
+	p.enqueueJSON(msg)
+	return nil
 }
 
 // ─── WebSocket 处理 ──────────────────────────────────────────────
@@ -171,7 +225,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[ws] upgrade error: %v", err)
 		return
 	}
-	defer conn.Close()
 
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -180,30 +233,24 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	})
 
 	var peer *PeerInfo
+
 	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ws] recovered panic in handleWS: %v", r)
+		}
 		if peer != nil {
 			hub.unregister(peer.InstanceID)
 		}
+		conn.Close()
 	}()
 
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if peer != nil {
-					peer.mu.Lock()
-					peer.conn.WriteMessage(websocket.PingMessage, nil)
-					peer.mu.Unlock()
-				}
-			}
+	// safeWrite 通过写入通道发送消息，完全避免 concurrent write
+	safeWrite := func(msg SignalMessage) {
+		if peer == nil {
+			return
 		}
-	}()
+		peer.enqueueJSON(msg)
+	}
 
 	for {
 		_, msgBytes, err := conn.ReadMessage()
@@ -246,13 +293,30 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				LocalPort:  reg.LocalPort,
 				conn:       conn,
 				lastSeen:   time.Now(),
+				writeCh:    make(chan writeMsg, 256),
+				closeCh:    make(chan struct{}),
 			}
+			go peer.writeLoop()
 			hub.register(peer)
-			conn.WriteJSON(SignalMessage{Type: "registered", Data: jsonRaw(map[string]string{"status": "ok"})})
+			safeWrite(SignalMessage{Type: "registered", Data: jsonRaw(map[string]string{"status": "ok"})})
+
+			// ping ticker 通过写入通道发送，不再直接写连接
+			go func(p *PeerInfo) {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-p.closeCh:
+						return
+					case <-ticker.C:
+						p.enqueue(writeMsg{msgType: websocket.PingMessage, data: nil})
+					}
+				}
+			}(peer)
 
 		case "list_peers":
 			peers := hub.listOnlinePeers()
-			conn.WriteJSON(SignalMessage{Type: "peers_list", Data: jsonRaw(peers)})
+			safeWrite(SignalMessage{Type: "peers_list", Data: jsonRaw(peers)})
 
 		case "relay":
 			if msg.To == "" || peer == nil {
@@ -262,7 +326,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[ws] relay from=%s to=%s dataLen=%d", peer.InstanceID, msg.To, len(msg.Data))
 			if err := hub.sendTo(msg.To, msg); err != nil {
 				log.Printf("[ws] relay delivery failed: from=%s to=%s reason=%v", peer.InstanceID, msg.To, err)
-				conn.WriteJSON(SignalMessage{
+				safeWrite(SignalMessage{
 					Type: "delivery_failed",
 					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "relay"}),
 				})
@@ -275,7 +339,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			msg.From = peer.InstanceID
 			log.Printf("[ws] conversation_invite from=%s to=%s", peer.InstanceID, msg.To)
 			if err := hub.sendTo(msg.To, msg); err != nil {
-				conn.WriteJSON(SignalMessage{
+				safeWrite(SignalMessage{
 					Type: "delivery_failed",
 					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "conversation_invite"}),
 				})
@@ -288,7 +352,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			msg.From = peer.InstanceID
 			log.Printf("[ws] conversation_accept from=%s to=%s", peer.InstanceID, msg.To)
 			if err := hub.sendTo(msg.To, msg); err != nil {
-				conn.WriteJSON(SignalMessage{
+				safeWrite(SignalMessage{
 					Type: "delivery_failed",
 					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "conversation_accept"}),
 				})
@@ -301,7 +365,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			msg.From = peer.InstanceID
 			log.Printf("[ws] conversation_reject from=%s to=%s", peer.InstanceID, msg.To)
 			if err := hub.sendTo(msg.To, msg); err != nil {
-				conn.WriteJSON(SignalMessage{
+				safeWrite(SignalMessage{
 					Type: "delivery_failed",
 					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "conversation_reject"}),
 				})
@@ -311,7 +375,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			if peer != nil {
 				peer.lastSeen = time.Now()
 			}
-			conn.WriteJSON(SignalMessage{Type: "heartbeat_ack"})
+			safeWrite(SignalMessage{Type: "heartbeat_ack"})
 		}
 	}
 }
