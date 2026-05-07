@@ -1,9 +1,6 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,12 +16,15 @@ import (
 // ─── 数据结构 ────────────────────────────────────────────────────
 
 type PeerInfo struct {
-	InstanceID string   `json:"instance_id"`
-	Nickname   string   `json:"nickname"`
-	UserID     string   `json:"user_id,omitempty"`
-	AvatarURL  string   `json:"avatar_url,omitempty"`
-	Agents     []Agent  `json:"agents"`
-	Addr       string   `json:"-"`
+	InstanceID string  `json:"instance_id"`
+	Nickname   string  `json:"nickname"`
+	UserID     string  `json:"user_id,omitempty"`
+	AvatarURL  string  `json:"avatar_url,omitempty"`
+	Agents     []Agent `json:"agents"`
+	Platform   string  `json:"platform,omitempty"`
+	DeviceName string  `json:"device_name,omitempty"`
+	LocalIP    string  `json:"local_ip,omitempty"`
+	LocalPort  int     `json:"local_port,omitempty"`
 	conn       *websocket.Conn
 	lastSeen   time.Time
 	mu         sync.Mutex
@@ -42,35 +42,6 @@ type SignalMessage struct {
 	From string          `json:"from,omitempty"`
 	To   string          `json:"to,omitempty"`
 	Data json.RawMessage `json:"data,omitempty"`
-	HMAC string          `json:"hmac,omitempty"` // 消息完整性签名
-	TS   int64           `json:"ts,omitempty"`   // 时间戳（防重放）
-}
-
-func computeHMAC(secret, msgType, from, to string, data []byte, ts int64) string {
-	if secret == "" {
-		return ""
-	}
-	h := hmac.New(sha256.New, []byte(secret))
-	h.Write([]byte(msgType))
-	h.Write([]byte(from))
-	h.Write([]byte(to))
-	h.Write(data)
-	h.Write([]byte(fmt.Sprintf("%d", ts)))
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func verifyHMAC(msg SignalMessage) bool {
-	if serverSecret == "" {
-		return true
-	}
-	if msg.HMAC == "" {
-		return false
-	}
-	if time.Now().Unix()-msg.TS > 300 {
-		return false
-	}
-	expected := computeHMAC(serverSecret, msg.Type, msg.From, msg.To, msg.Data, msg.TS)
-	return hmac.Equal([]byte(expected), []byte(msg.HMAC))
 }
 
 // ─── Hub 管理所有连接 ────────────────────────────────────────────
@@ -82,7 +53,7 @@ type Hub struct {
 
 var hub = &Hub{peers: make(map[string]*PeerInfo)}
 
-var allowedOrigins = os.Getenv("ALLOWED_ORIGINS") // 逗号分隔，空值允许所有
+var allowedOrigins = os.Getenv("ALLOWED_ORIGINS")
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -99,8 +70,6 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-var serverSecret = os.Getenv("SIGNALING_SECRET") // HMAC 签名密钥
-
 func (h *Hub) register(p *PeerInfo) {
 	h.mu.Lock()
 	if old, ok := h.peers[p.InstanceID]; ok {
@@ -110,9 +79,9 @@ func (h *Hub) register(p *PeerInfo) {
 	}
 	h.peers[p.InstanceID] = p
 	h.mu.Unlock()
-	log.Printf("[hub] registered: %s (%s)", p.InstanceID, p.Nickname)
+	log.Printf("[hub] registered: %s (%s) platform=%s device=%s ip=%s port=%d",
+		p.InstanceID, p.Nickname, p.Platform, p.DeviceName, p.LocalIP, p.LocalPort)
 
-	// 广播 peer_online 给所有其他在线节点
 	h.broadcastPeerEvent("peer_online", p)
 }
 
@@ -123,7 +92,6 @@ func (h *Hub) unregister(id string) {
 	h.mu.Unlock()
 	log.Printf("[hub] unregistered: %s", id)
 
-	// 广播 peer_offline 给所有其他在线节点
 	if p != nil {
 		h.broadcastPeerEvent("peer_offline", p)
 	}
@@ -136,6 +104,10 @@ func (h *Hub) broadcastPeerEvent(eventType string, p *PeerInfo) {
 		"user_id":     p.UserID,
 		"avatar_url":  p.AvatarURL,
 		"agents":      p.Agents,
+		"platform":    p.Platform,
+		"device_name": p.DeviceName,
+		"local_ip":    p.LocalIP,
+		"local_port":  p.LocalPort,
 	})
 	msg := SignalMessage{Type: eventType, Data: data}
 
@@ -170,6 +142,10 @@ func (h *Hub) listOnlinePeers() []map[string]interface{} {
 			"user_id":     p.UserID,
 			"avatar_url":  p.AvatarURL,
 			"agents":      p.Agents,
+			"platform":    p.Platform,
+			"device_name": p.DeviceName,
+			"local_ip":    p.LocalIP,
+			"local_port":  p.LocalPort,
 		})
 	}
 	return out
@@ -210,7 +186,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Ping goroutine
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -250,6 +225,10 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				UserID     string  `json:"user_id"`
 				AvatarURL  string  `json:"avatar_url"`
 				Agents     []Agent `json:"agents"`
+				Platform   string  `json:"platform"`
+				DeviceName string  `json:"device_name"`
+				LocalIP    string  `json:"local_ip"`
+				LocalPort  int     `json:"local_port"`
 			}
 			json.Unmarshal(msg.Data, &reg)
 			if reg.InstanceID == "" {
@@ -261,6 +240,10 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				UserID:     reg.UserID,
 				AvatarURL:  reg.AvatarURL,
 				Agents:     reg.Agents,
+				Platform:   reg.Platform,
+				DeviceName: reg.DeviceName,
+				LocalIP:    reg.LocalIP,
+				LocalPort:  reg.LocalPort,
 				conn:       conn,
 				lastSeen:   time.Now(),
 			}
@@ -271,62 +254,56 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			peers := hub.listOnlinePeers()
 			conn.WriteJSON(SignalMessage{Type: "peers_list", Data: jsonRaw(peers)})
 
-		case "signal":
-			if msg.To == "" || peer == nil {
-				continue
-			}
-			if serverSecret != "" && !verifyHMAC(msg) {
-				log.Printf("[ws] HMAC verification failed for signal from %s", peer.InstanceID)
-				continue
-			}
-			msg.From = peer.InstanceID
-			hub.sendTo(msg.To, msg)
-
-		case "connect_request":
-			if msg.To == "" || peer == nil {
-				continue
-			}
-			if serverSecret != "" && !verifyHMAC(msg) {
-				log.Printf("[ws] HMAC verification failed for connect_request from %s", peer.InstanceID)
-				continue
-			}
-			msg.From = peer.InstanceID
-			if err := hub.sendTo(msg.To, msg); err != nil {
-				conn.WriteJSON(SignalMessage{
-					Type: "delivery_failed",
-					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "connect_request"}),
-				})
-			}
-
-		case "connect_respond":
-			if msg.To == "" || peer == nil {
-				continue
-			}
-			if serverSecret != "" && !verifyHMAC(msg) {
-				log.Printf("[ws] HMAC verification failed for connect_respond from %s", peer.InstanceID)
-				continue
-			}
-			msg.From = peer.InstanceID
-			if err := hub.sendTo(msg.To, msg); err != nil {
-				conn.WriteJSON(SignalMessage{
-					Type: "delivery_failed",
-					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "connect_respond"}),
-				})
-			}
-
 		case "relay":
 			if msg.To == "" || peer == nil {
 				continue
 			}
-			if serverSecret != "" && !verifyHMAC(msg) {
-				log.Printf("[ws] HMAC verification failed for relay from %s", peer.InstanceID)
-				continue
-			}
 			msg.From = peer.InstanceID
+			log.Printf("[ws] relay from=%s to=%s dataLen=%d", peer.InstanceID, msg.To, len(msg.Data))
 			if err := hub.sendTo(msg.To, msg); err != nil {
+				log.Printf("[ws] relay delivery failed: from=%s to=%s reason=%v", peer.InstanceID, msg.To, err)
 				conn.WriteJSON(SignalMessage{
 					Type: "delivery_failed",
 					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "relay"}),
+				})
+			}
+
+		case "conversation_invite":
+			if msg.To == "" || peer == nil {
+				continue
+			}
+			msg.From = peer.InstanceID
+			log.Printf("[ws] conversation_invite from=%s to=%s", peer.InstanceID, msg.To)
+			if err := hub.sendTo(msg.To, msg); err != nil {
+				conn.WriteJSON(SignalMessage{
+					Type: "delivery_failed",
+					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "conversation_invite"}),
+				})
+			}
+
+		case "conversation_accept":
+			if msg.To == "" || peer == nil {
+				continue
+			}
+			msg.From = peer.InstanceID
+			log.Printf("[ws] conversation_accept from=%s to=%s", peer.InstanceID, msg.To)
+			if err := hub.sendTo(msg.To, msg); err != nil {
+				conn.WriteJSON(SignalMessage{
+					Type: "delivery_failed",
+					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "conversation_accept"}),
+				})
+			}
+
+		case "conversation_reject":
+			if msg.To == "" || peer == nil {
+				continue
+			}
+			msg.From = peer.InstanceID
+			log.Printf("[ws] conversation_reject from=%s to=%s", peer.InstanceID, msg.To)
+			if err := hub.sendTo(msg.To, msg); err != nil {
+				conn.WriteJSON(SignalMessage{
+					Type: "delivery_failed",
+					Data: jsonRaw(map[string]string{"to": msg.To, "reason": "peer_offline", "original_type": "conversation_reject"}),
 				})
 			}
 
